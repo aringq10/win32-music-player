@@ -21,14 +21,11 @@
 #pragma comment(lib, "mfplat.lib")
 #pragma comment(lib, "mfreadwrite.lib")
 #pragma comment(lib, "mf.lib")
-#pragma comment(lib, "mfuuid.lib") // for IMFSourceReader GUIDs
+#pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
 #pragma comment(lib, "Comdlg32.lib")
 #pragma comment(lib, "Gdi32.lib")
-
-// // Global variable for mouse coordinates
-// wchar_t g_MouseCoordinates[64] = L"X: 0, Y: 0";
 
 // Globals
 wchar_t g_Path[MAX_PATH] = L"";
@@ -39,14 +36,6 @@ ID2D1Factory*           g_pD2DFactory = nullptr;
 ID2D1HwndRenderTarget*  g_pRenderTarget = nullptr;
 ID2D1SolidColorBrush*   g_pBrush = nullptr;
 
-// Globals for dragging
-bool g_isDraggingProgress = false;
-bool g_isDraggingVolume = false;
-
-// Forward declaration for MediaSessionCallback
-class MediaSessionCallback;
-
-// UI Rectangles
 D2D1_RECT_F g_rcButtonPrev;
 D2D1_RECT_F g_rcButtonPlay;
 D2D1_RECT_F g_rcButtonNext;
@@ -54,19 +43,24 @@ D2D1_RECT_F g_rcSliderProgress;
 D2D1_RECT_F g_rcSliderVolume;
 D2D1_RECT_F g_rcButtonOpenFile;
 
-
 // Slider thumb positions
 float g_progressValue = 0.0f; // 0.0 to 1.0
 float g_volumeValue = 1.0f;   // 0.0 to 1.0
+bool g_isDraggingProgress = false;
+bool g_isDraggingVolume = false;
 
 // Media Foundation globals
 IMFMediaSession* g_pMediaSession = nullptr;
 IMFMediaSource* g_pMediaSource = nullptr;
-MediaSessionCallback* g_pCallBack = nullptr;
 
+LONGLONG g_totalDuration = 0; // currently loaded song in 100ns units
 bool g_isPlaying = false;
+bool g_updateProgress = true;
 
 // Forward declarations
+class MediaSessionCallback;
+MediaSessionCallback* g_pCallBack = nullptr;
+
 HRESULT CreateGraphicsResources(HWND hwnd);
 void DiscardGraphicsResources();
 void OnPaint(HWND hwnd);
@@ -76,7 +70,7 @@ void UpdateProgressBar(HWND hwnd);
 
 void OnLButtonDown(HWND hwnd, WPARAM wParam, LPARAM lParam);
 void OnMouseMove(HWND hwnd, WPARAM wParam, LPARAM lParam);
-void OnLButtonUp(HWND hwnd);
+void OnLButtonUp();
 void OpenFileExplorer(HWND hwnd);
 
 HRESULT InitMediaFoundation();
@@ -87,6 +81,9 @@ HRESULT AddSourceNode(IMFTopology* pTopology, IMFMediaSource* pMediaSource, IMFP
 HRESULT AddOutputNode(IMFTopology* pTopology, IMFActivate* pActivate, IMFTopologyNode** ppNode);
 void PlayAudio();
 void PauseAudio();
+HRESULT GetCurrentPlaybackTime(LONGLONG* p_currentTime);
+void SeekToTime(LONGLONG newTime100ns);
+void SeekBySeconds(LONGLONG offsetSeconds);
 
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
@@ -185,21 +182,21 @@ public:
             {
                 pEvent->GetType(&eventType);
     
-                // Handle specific events
-                if (eventType == MESessionStarted)
+                switch (eventType)
                 {
+                    case MESessionEnded:
+                        // Reset the UI state
+                        g_progressValue = 0.0f;
+                        g_isPlaying = false;
+                        wcscpy_s(g_Path, MAX_PATH, L"");
+                        InvalidateRect(NULL, NULL, FALSE);
+
+                        MessageBox(NULL, L"Song ended", L"Info", MB_OK);
+                        break;
                     
-                }
-                else if (eventType == MESessionEnded)
-                {
-                    g_isPlaying = false;
-                    wcscpy_s(g_Path, MAX_PATH, L"");
-                    InvalidateRect(NULL, NULL, FALSE);
-                    MessageBox(NULL, L"Playback ended", L"Info", MB_OK);
-                }
-                else if (eventType == MEError)
-                {
-                    MessageBox(NULL, L"An error occurred during playback.", L"Error", MB_ICONERROR);
+                    case MEError:
+                        MessageBox(NULL, L"An error occurred during playback.", L"Error", MB_ICONERROR);
+                        break;
                 }
     
                 // Continue listening for events
@@ -354,13 +351,6 @@ void OnPaint(HWND hwnd)
         }
 
         EndPaint(hwnd, &ps);
-
-        // Draw the mouse coordinates using TextOut
-        // HDC hdc = GetDC(hwnd);
-        // SetBkMode(hdc, TRANSPARENT);
-        // SetTextColor(hdc, RGB(255, 255, 255));
-        // TextOut(hdc, 10, 10, g_MouseCoordinates, wcslen(g_MouseCoordinates));
-        // ReleaseDC(hwnd, hdc);
     }
 }
 
@@ -400,44 +390,18 @@ void UpdateProgressBar(HWND hwnd)
 {
     if (!g_pMediaSession || !g_pMediaSource) return;
 
-    IMFClock* pClock = nullptr;
-    IMFPresentationDescriptor* pPresentationDescriptor = nullptr;
-    HRESULT hr = S_OK;
-
-    // Get the clock from the Media Session
-    hr = g_pMediaSession->GetClock(&pClock);
-    if (FAILED(hr)) goto done;
-
     // Get the current playback time
     LONGLONG currentTime = 0;
-    LONGLONG systemTime = 0;
-    hr = pClock->GetCorrelatedTime(0, &currentTime, &systemTime);
-    if (FAILED(hr)) goto done;
-
-    // Get the presentation descriptor
-    hr = g_pMediaSource->CreatePresentationDescriptor(&pPresentationDescriptor);
-    if (FAILED(hr)) goto done;
-
-    // Get the total duration of the media
-    UINT64 totalDuration = 0;
-    hr = pPresentationDescriptor->GetUINT64(MF_PD_DURATION, (UINT64*)&totalDuration);
-    if (FAILED(hr)) goto done;
-
-    if (totalDuration == 0) goto done;
+    HRESULT hr = GetCurrentPlaybackTime(&currentTime);
+    if (FAILED(hr)) return;
 
     // Update the progress value (0.0 to 1.0)
-    g_progressValue = (double)currentTime / (double)totalDuration;
+    g_progressValue = (double)currentTime / (double)g_totalDuration;
     if (g_progressValue < 0.0) g_progressValue = 0.0;
     if (g_progressValue > 1.0) g_progressValue = 1.0;
 
-
     // Redraw the window to update the progress bar
     InvalidateRect(hwnd, NULL, FALSE);
-
-done:
-    SafeRelease(&pClock);
-    SafeRelease(&pPresentationDescriptor);
-    return;
 }
 
 // Mouse/Input events
@@ -475,7 +439,8 @@ void OnLButtonDown(HWND hwnd, WPARAM wParam, LPARAM lParam)
     }
     // Check if clicked on progress bar
     else if (PtInRect(&ConvertRectFToRect(g_rcSliderProgress), pt)) {
-        return; // Skip for now
+        if (!g_isPlaying) return;
+        g_updateProgress = false;
         g_isDraggingProgress = true;
 
         float sliderWidth = g_rcSliderProgress.right - g_rcSliderProgress.left;
@@ -512,15 +477,6 @@ void OnLButtonDown(HWND hwnd, WPARAM wParam, LPARAM lParam)
 
 void OnMouseMove(HWND hwnd, WPARAM wParam, LPARAM lParam)
 {
-    // int x = (SHORT)LOWORD(lParam); // Get the x-coordinate
-    // int y = (SHORT)HIWORD(lParam); // Get the y-coordinate
-
-    // // Update the global mouse coordinates string
-    // swprintf_s(g_MouseCoordinates, L"X: %d, Y: %d", x, y);
-
-    // // Redraw the window to update the text box
-    // InvalidateRect(hwnd, NULL, FALSE);
-
     if (wParam & MK_LBUTTON) {
         POINT pt = { (SHORT)LOWORD(lParam), (SHORT)HIWORD(lParam) };
         D2D1_POINT_2F movePoint = D2D1::Point2F((FLOAT)pt.x, (FLOAT)pt.y);
@@ -533,7 +489,7 @@ void OnMouseMove(HWND hwnd, WPARAM wParam, LPARAM lParam)
             if (movePoint.x > g_rcSliderProgress.right) movePoint.x = g_rcSliderProgress.right;
 
             g_progressValue = (movePoint.x - g_rcSliderProgress.left) / sliderWidth;
-            if (!g_isPlaying) InvalidateRect(hwnd, NULL, FALSE);
+            InvalidateRect(hwnd, NULL, FALSE);
         }
         else if (g_isDraggingVolume) {
             float sliderWidth = g_rcSliderVolume.right - g_rcSliderVolume.left;
@@ -554,12 +510,18 @@ void OnMouseMove(HWND hwnd, WPARAM wParam, LPARAM lParam)
 void OnLButtonUp()
 {
     ReleaseCapture();
+    if (g_isDraggingProgress)
+    {
+        SeekToTime((LONGLONG)(g_progressValue * g_totalDuration));
+    }
+    g_updateProgress = true;
     g_isDraggingProgress = false;
     g_isDraggingVolume = false;
 }
 
 void OpenFileExplorer(HWND hwnd)
 {
+    
     OPENFILENAME ofn;       // Common dialog box structure
     wchar_t szFile[MAX_PATH] = L""; // Buffer for file name
 
@@ -691,13 +653,17 @@ HRESULT CreatePlaybackTopology(IMFMediaSource* pMediaSource, IMFMediaSession* pM
     // Get the presentation descriptor for the media source
     hr = pMediaSource->CreatePresentationDescriptor(&pPresentationDescriptor);
     if (FAILED(hr)) goto done;
+    else 
+    {   // Get the total duration of the loaded media
+        pPresentationDescriptor->GetUINT64(MF_PD_DURATION, (UINT64*)&g_totalDuration);
+    }
 
     // Get the first audio stream
     hr = pPresentationDescriptor->GetStreamDescriptorByIndex(0, &streamSelected, &pStreamDescriptor);
     if (FAILED(hr)) goto done;
 
     if (streamSelected)
-    {
+    {   
         // Create the audio renderer activation object
         hr = MFCreateAudioRendererActivate(&pAudioRendererActivate);
         if (FAILED(hr)) goto done;
@@ -811,6 +777,64 @@ void PauseAudio()
     }
 }
 
+HRESULT GetCurrentPlaybackTime(LONGLONG* p_currentTime)
+{
+    if (!g_pMediaSession)
+        return 0;
+
+    IMFClock* pClock = nullptr;
+    LONGLONG currentTime = 0, systemTime = 0;
+
+    HRESULT hr = g_pMediaSession->GetClock(&pClock);
+    if(FAILED(hr)) goto done;
+
+    hr = pClock->GetCorrelatedTime(0, &currentTime, &systemTime);
+    if(FAILED(hr)) goto done;
+
+    *p_currentTime = currentTime;
+
+done:
+    SafeRelease(&pClock);
+    return hr;
+}
+
+void SeekToTime(LONGLONG newTime100ns)
+{
+    if (!g_pMediaSession || !g_pMediaSource) return;
+
+    IMFPresentationDescriptor* pPD = nullptr;
+    UINT64 totalDuration = 0;
+
+
+    if (newTime100ns < 0) newTime100ns = 0;
+    if (newTime100ns > g_totalDuration)
+        newTime100ns = g_totalDuration;
+
+    PROPVARIANT varStart;
+    PropVariantInit(&varStart);
+    varStart.vt = VT_I8;
+    varStart.hVal.QuadPart = newTime100ns;
+
+    HRESULT hr = g_pMediaSession->Start(&GUID_NULL, &varStart);
+    if (FAILED(hr)) {
+        MessageBox(NULL, L"Seek failed", L"Error", MB_ICONERROR);
+    }
+
+    PropVariantClear(&varStart);
+    SafeRelease(&pPD);
+}
+
+void SeekBySeconds(LONGLONG offsetSeconds)
+{
+    if (!g_pMediaSession || !g_pMediaSource) return;
+
+    LONGLONG currentTime = 0;
+    HRESULT hr = GetCurrentPlaybackTime(&currentTime);
+    if (FAILED(hr)) return;
+    
+    SeekToTime(currentTime + offsetSeconds * 10000000);
+}
+
 // Window Procedure
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 {
@@ -868,7 +892,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         switch (wParam)
         {
         case VK_SPACE: // Spacebar to play/pause
-            if (wcslen(g_Path) == 0) {
+            if (wcslen(g_Path) == 0) 
+            {
                 MessageBox(hwnd, L"No file selected. Please select a file before playing.", L"Warning", MB_ICONWARNING);
             }
             else
@@ -888,11 +913,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
     
         case VK_LEFT: // Left arrow to go to the previous track
-            MessageBox(hwnd, L"Previous track shortcut triggered!", L"Info", MB_OK);
+            SeekBySeconds(-5);
             break;
     
         case VK_RIGHT: // Right arrow to go to the next track
-            MessageBox(hwnd, L"Next track shortcut triggered!", L"Info", MB_OK);
+            SeekBySeconds(5);
             break;
     
         case VK_UP: // Up arrow to increase volume
@@ -919,7 +944,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
 
     case WM_TIMER:
-        if (wParam == 1 && g_isPlaying) {
+        if (wParam == 1 && g_isPlaying && g_updateProgress) 
+        {
             UpdateProgressBar(hwnd);
         }
         break;
