@@ -2,6 +2,8 @@
 #define UNICODE
 #endif
 
+#define WM_PLAY_NEXT_TRACK (WM_USER + 1)
+
 // Headers and libraries
 #include <windows.h>
 #include <d2d1.h>
@@ -14,6 +16,10 @@
 #include <endpointvolume.h>
 #include <commdlg.h>
 #include <string>
+#include <vector>
+#include <filesystem> // C++17
+#include <random>
+#include <shobjidl.h>
 
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "d2d1.lib")
@@ -24,11 +30,13 @@
 #pragma comment(lib, "mfuuid.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "uuid.lib")
-#pragma comment(lib, "Comdlg32.lib")
-#pragma comment(lib, "Gdi32.lib")
+#pragma comment(lib, "comdlg32.lib")
+#pragma comment(lib, "gdi32.lib")
 
 // Globals
-wchar_t g_Path[MAX_PATH] = L"";
+std::vector<std::wstring> g_playlist;
+size_t g_currentTrackIndex = 0;
+
 HINSTANCE g_hInstance;
 HWND g_hWnd = NULL;
 
@@ -60,31 +68,34 @@ bool g_updateProgress = true;
 // Forward declarations
 class MediaSessionCallback;
 MediaSessionCallback* g_pCallBack = nullptr;
-
+// Graphic functions
 HRESULT CreateGraphicsResources(HWND hwnd);
 void DiscardGraphicsResources();
 void OnPaint(HWND hwnd);
 void Resize(HWND hwnd);
 void CalculateLayout(float width, float height);
 void UpdateProgressBar(HWND hwnd);
-
+// Mouse/Input events
 void OnLButtonDown(HWND hwnd, WPARAM wParam, LPARAM lParam);
 void OnMouseMove(HWND hwnd, WPARAM wParam, LPARAM lParam);
 void OnLButtonUp();
-void OpenFileExplorer(HWND hwnd);
-
+HRESULT OpenFolderDialog(HWND hwnd, std::wstring& folderPath);
+void BuildPlaylistFromFolder(const std::wstring& folderPath);
+// Media Session Initialization
 HRESULT InitMediaFoundation();
 void CleanupMediaFoundation();
 HRESULT InitializeMediaSession(const wchar_t* filePath);
 HRESULT CreatePlaybackTopology(IMFMediaSource* pMediaSource, IMFMediaSession* pMediaSession, IMFTopology** ppTopology);
 HRESULT AddSourceNode(IMFTopology* pTopology, IMFMediaSource* pMediaSource, IMFPresentationDescriptor* pPresentationDescriptor, IMFStreamDescriptor* pStreamDescriptor, IMFTopologyNode** ppNode);
 HRESULT AddOutputNode(IMFTopology* pTopology, IMFActivate* pActivate, IMFTopologyNode** ppNode);
+// Playback handling
 void PlayAudio();
 void PauseAudio();
 HRESULT GetCurrentPlaybackTime(LONGLONG* p_currentTime);
 void SeekToTime(LONGLONG newTime100ns);
 void SeekBySeconds(LONGLONG offsetSeconds);
-
+HRESULT Backwards();
+HRESULT Forwards();
 
 LRESULT CALLBACK WndProc(HWND, UINT, WPARAM, LPARAM);
 
@@ -187,11 +198,9 @@ public:
                     case MESessionEnded:
                         // Reset the UI state
                         g_progressValue = 0.0f;
-                        g_isPlaying = false;
-                        wcscpy_s(g_Path, MAX_PATH, L"");
                         InvalidateRect(NULL, NULL, FALSE);
-
-                        MessageBox(NULL, L"Song ended", L"Info", MB_OK);
+                        // Play next song
+                        PostMessage(g_hWnd, WM_PLAY_NEXT_TRACK, 0, 0);
                         break;
                     
                     case MEError:
@@ -211,61 +220,7 @@ private:
     LONG m_refCount = 1;
 };
 
-// WinMain
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
-{
-    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
-    if (FAILED(hr))
-    {
-        MessageBox(NULL, L"COM Initialization failed", L"Error", MB_ICONERROR);
-        return -1;
-    }
-
-    g_hInstance = hInstance;
-    LPCWSTR wndClass = L"AudioPlayerWindowClass";
-
-    // Register window class
-    WNDCLASS wc = { };
-    wc.lpfnWndProc   = WndProc;
-    wc.hInstance     = hInstance;
-    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
-    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
-    wc.lpszClassName = wndClass;
-
-    RegisterClass(&wc);
-
-    // Create window
-    g_hWnd = CreateWindowEx(
-        0,
-        wndClass,
-        L"Audio Player",
-        WS_OVERLAPPEDWINDOW,
-        CW_USEDEFAULT, 
-        CW_USEDEFAULT, 
-        800, 
-        600,
-        NULL, 
-        NULL, 
-        hInstance, 
-        NULL
-    );
-
-    ShowWindow(g_hWnd, nCmdShow);
-    UpdateWindow(g_hWnd);
-
-    // Message loop
-    MSG msg;
-    while (GetMessage(&msg, NULL, 0, 0))
-    {
-        TranslateMessage(&msg);
-        DispatchMessage(&msg);
-    }
-
-    CoUninitialize();
-    return 0;
-}
-
-// Graphics functions
+// Graphic functions
 HRESULT CreateGraphicsResources(HWND hwnd)
 {
     HRESULT hr = S_OK;
@@ -414,8 +369,8 @@ void OnLButtonDown(HWND hwnd, WPARAM wParam, LPARAM lParam)
     // Check buttons
     if (PtInRect(&ConvertRectFToRect(g_rcButtonPlay), pt)) {
         // Check if a file has been selected
-        if (wcslen(g_Path) == 0) {
-            MessageBox(hwnd, L"No file selected. Please select a file before playing.", L"Warning", MB_ICONWARNING);
+        if (g_playlist.empty()) {
+            MessageBox(hwnd, L"No folder selected.", L"Info", MB_OK);
             return;
         }
         
@@ -432,11 +387,13 @@ void OnLButtonDown(HWND hwnd, WPARAM wParam, LPARAM lParam)
         InvalidateRect(hwnd, NULL, FALSE);
     }
     else if (PtInRect(&ConvertRectFToRect(g_rcButtonPrev), pt)) {
-        MessageBox(hwnd, L"Previous button clicked!", L"Info", MB_OK);
+        if (FAILED(Backwards())) MessageBox(hwnd, L"Failed backwards", L"Error", MB_ICONERROR);
+        InvalidateRect(hwnd, NULL, FALSE);
     }
     else if (PtInRect(&ConvertRectFToRect(g_rcButtonNext), pt)) {
-        MessageBox(hwnd, L"Next button clicked!", L"Info", MB_OK);
-    }
+        if (FAILED(Forwards())) MessageBox(hwnd, L"Failed forwards", L"Error", MB_ICONERROR);
+        InvalidateRect(hwnd, NULL, FALSE);
+    }    
     // Check if clicked on progress bar
     else if (PtInRect(&ConvertRectFToRect(g_rcSliderProgress), pt)) {
         if (!g_isPlaying) return;
@@ -470,7 +427,15 @@ void OnLButtonDown(HWND hwnd, WPARAM wParam, LPARAM lParam)
         InvalidateRect(hwnd, NULL, FALSE);
     }
     else if (PtInRect(&ConvertRectFToRect(g_rcButtonOpenFile), pt)) {
-        OpenFileExplorer(hwnd);
+        // Get folder path
+        std::wstring folderPath;
+        HRESULT hr = OpenFolderDialog(hwnd, folderPath);
+        if (FAILED(hr)) return;
+        // Build playlist and load first song for playing
+        BuildPlaylistFromFolder(folderPath);
+        hr = InitializeMediaSession(g_playlist[g_currentTrackIndex].c_str());
+        if (FAILED(hr)) return;
+
         InvalidateRect(hwnd, NULL, FALSE);
     }
 }
@@ -519,38 +484,68 @@ void OnLButtonUp()
     g_isDraggingVolume = false;
 }
 
-void OpenFileExplorer(HWND hwnd)
+HRESULT OpenFolderDialog(HWND hwnd, std::wstring& folderPath)
 {
-    
-    OPENFILENAME ofn;       // Common dialog box structure
-    wchar_t szFile[MAX_PATH] = L""; // Buffer for file name
+    IFileDialog* pFileDialog = nullptr;
+    IShellItem* pItem = nullptr;
+    PWSTR pszFolderPath = nullptr;
+    HRESULT hr = S_OK;
 
-    // Initialize OPENFILENAME
-    ZeroMemory(&ofn, sizeof(ofn));
-    ofn.lStructSize = sizeof(ofn);
-    ofn.hwndOwner = hwnd;
-    ofn.lpstrFile = szFile;
-    ofn.nMaxFile = sizeof(szFile) / sizeof(szFile[0]);
-    ofn.lpstrFilter = L"MP3 Files\0*.MP3\0All Files\0*.*\0";
-    ofn.nFilterIndex = 1;
-    ofn.Flags = OFN_PATHMUSTEXIST | OFN_FILEMUSTEXIST;
+    hr = CoCreateInstance(CLSID_FileOpenDialog, NULL, CLSCTX_ALL, IID_PPV_ARGS(&pFileDialog));
+    if (FAILED(hr)) goto done;
 
-    // Display the Open dialog box
-    if (GetOpenFileName(&ofn) == TRUE) {
-        // Assign the selected file path to g_Path
-        wcscpy_s(g_Path, MAX_PATH, ofn.lpstrFile);
+    DWORD dwOptions = 0;
+    hr = pFileDialog->GetOptions(&dwOptions);
+    if (FAILED(hr)) goto done;
 
-        // Initialize the Media Session with the selected file
-        HRESULT hr = InitializeMediaSession(g_Path);
-        if (FAILED(hr)) {
-            MessageBox(hwnd, L"Failed to initialize Media Session for the selected file.", L"Error", MB_ICONERROR);
-        } else {
-            MessageBox(hwnd, L"File loaded successfully! Ready to play.", L"Info", MB_OK);
-        }
-    }
+    hr = pFileDialog->SetOptions(dwOptions | FOS_PICKFOLDERS);
+    if (FAILED(hr)) goto done;
+
+    hr = pFileDialog->Show(hwnd);
+    if (FAILED(hr)) goto done;
+
+    hr = pFileDialog->GetResult(&pItem);
+    if (FAILED(hr)) goto done;
+
+    hr = pItem->GetDisplayName(SIGDN_FILESYSPATH, &pszFolderPath);
+    if (FAILED(hr)) goto done;
+
+    folderPath = pszFolderPath;
+
+done:
+    if (pszFolderPath)
+        CoTaskMemFree(pszFolderPath);
+
+    SafeRelease(&pItem);
+    SafeRelease(&pFileDialog);
+
+    return hr;
 }
 
-// Audio Handling
+void BuildPlaylistFromFolder(const std::wstring& folderPath)
+{
+    g_playlist.clear();
+    for (const auto& entry : std::filesystem::directory_iterator(folderPath))
+    {
+        if (!entry.is_regular_file()) continue;
+
+        std::wstring path = entry.path().wstring();
+        std::wstring ext = entry.path().extension().wstring();
+
+        if (_wcsicmp(ext.c_str(), L".mp3") == 0 || _wcsicmp(ext.c_str(), L".wav") == 0)
+        {
+            g_playlist.push_back(path);
+        }
+    }
+
+    // Shuffle the playlist
+    std::random_device rd;
+    std::mt19937 g(rd());
+    std::shuffle(g_playlist.begin(), g_playlist.end(), g);
+    g_currentTrackIndex = 0;
+}
+
+// Media Session Initialization
 HRESULT InitMediaFoundation()
 {
     return MFStartup(MF_VERSION);
@@ -566,6 +561,21 @@ void CleanupMediaFoundation()
 
 HRESULT InitializeMediaSession(const wchar_t* filePath)
 {
+    // Clean up previous session and source
+    if (g_pMediaSession)
+    {
+        g_pMediaSession->Close();  // Optional: initiate async close
+        SafeRelease(&g_pMediaSession);
+    }
+    if (g_pMediaSource)
+    {
+        SafeRelease(&g_pMediaSource);
+    }
+    if (g_pCallBack)
+    {
+        SafeRelease(&g_pCallBack);
+    }
+
     HRESULT hr = S_OK;
     IMFSourceResolver* pSourceResolver = nullptr;
     IUnknown* pSource = nullptr;
@@ -754,6 +764,7 @@ done:
     return hr;
 }
 
+// Playback handling
 void PlayAudio()
 {
     if (g_pMediaSession)
@@ -835,6 +846,44 @@ void SeekBySeconds(LONGLONG offsetSeconds)
     SeekToTime(currentTime + offsetSeconds * 10000000);
 }
 
+HRESULT Backwards()
+{
+    HRESULT hr = S_OK;
+    if (!g_playlist.empty()) {
+        g_currentTrackIndex = (g_currentTrackIndex == 0) ? g_playlist.size() - 1 : g_currentTrackIndex - 1;
+
+        hr = InitializeMediaSession(g_playlist[g_currentTrackIndex].c_str());
+        if(FAILED(hr))
+        {
+            g_isPlaying = false;
+            return hr;
+        }
+
+        g_isPlaying = true;
+        PlayAudio();
+    }
+    return hr;
+}
+
+HRESULT Forwards()
+{
+    HRESULT hr = S_OK;
+    if (!g_playlist.empty()) {
+        g_currentTrackIndex = (g_currentTrackIndex + 1) % g_playlist.size();
+
+        hr = InitializeMediaSession(g_playlist[g_currentTrackIndex].c_str());
+        if(FAILED(hr))
+        {
+            g_isPlaying = false;
+            return hr;
+        }
+
+        g_isPlaying = true;
+        PlayAudio();
+    }
+    return hr;
+}
+
 // Window Procedure
 LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) 
 {
@@ -889,12 +938,15 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         break;
     
     case WM_KEYDOWN:
+    {
+        bool ctrlDown = (GetKeyState(VK_CONTROL) & 0x8000) != 0;
+
         switch (wParam)
         {
         case VK_SPACE: // Spacebar to play/pause
-            if (wcslen(g_Path) == 0) 
+            if (g_playlist.empty()) 
             {
-                MessageBox(hwnd, L"No file selected. Please select a file before playing.", L"Warning", MB_ICONWARNING);
+                MessageBox(hwnd, L"No folder selected.", L"Info", MB_OK);
             }
             else
             {
@@ -912,12 +964,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             InvalidateRect(hwnd, NULL, FALSE);
             break;
     
-        case VK_LEFT: // Left arrow to go to the previous track
-            SeekBySeconds(-5);
+        case VK_LEFT:
+            if (ctrlDown) {
+                if (FAILED(Backwards())) break;
+            } else if (g_isPlaying) {
+                SeekBySeconds(-5);
+            }
             break;
-    
-        case VK_RIGHT: // Right arrow to go to the next track
-            SeekBySeconds(5);
+        
+        case VK_RIGHT:
+            if (ctrlDown) {
+                if (FAILED(Forwards())) break;
+            } else if (g_isPlaying) {
+                SeekBySeconds(5);
+            }
             break;
     
         case VK_UP: // Up arrow to increase volume
@@ -935,20 +995,35 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
 
         case 'O': // 'O' key to open the file dialog
-            OpenFileExplorer(hwnd);
+        {
+            // Get folder path
+            std::wstring folderPath;
+            if (FAILED(OpenFolderDialog(hwnd, folderPath))) break;
+
+            // Build playlist and load first song for playing
+            BuildPlaylistFromFolder(folderPath);
+            if (FAILED(InitializeMediaSession(g_playlist[g_currentTrackIndex].c_str()))) break;
+
+            InvalidateRect(hwnd, NULL, FALSE);
             break;
-    
+        }
+        
         default:
             break;
         }
         break;
+    }
 
     case WM_TIMER:
-        if (wParam == 1 && g_isPlaying && g_updateProgress) 
-        {
+        if (wParam == 1 && g_isPlaying && g_updateProgress)
             UpdateProgressBar(hwnd);
-        }
         break;
+
+    case WM_PLAY_NEXT_TRACK:
+        if (FAILED(Forwards())) break;
+        InvalidateRect(hwnd, NULL, FALSE);
+        break;
+    
 
     case WM_DESTROY:
         KillTimer(hwnd, 1);
@@ -961,5 +1036,58 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     default:
         return DefWindowProc(hwnd, msg, wParam, lParam);
     }
+    return 0;
+}
+
+// WinMain
+int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow)
+{
+    HRESULT hr = CoInitializeEx(NULL, COINIT_APARTMENTTHREADED);
+    if (FAILED(hr))
+    {
+        MessageBox(NULL, L"COM Initialization failed", L"Error", MB_ICONERROR);
+        return -1;
+    }
+
+    LPCWSTR wndClass = L"AudioPlayerWindowClass";
+
+    // Register window class
+    WNDCLASS wc = { };
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInstance;
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    wc.lpszClassName = wndClass;
+
+    RegisterClass(&wc);
+
+    // Create window
+    g_hWnd = CreateWindowEx(
+        0,
+        wndClass,
+        L"Audio Player",
+        WS_OVERLAPPEDWINDOW,
+        CW_USEDEFAULT, 
+        CW_USEDEFAULT, 
+        800, 
+        600,
+        NULL, 
+        NULL, 
+        hInstance, 
+        NULL
+    );
+
+    ShowWindow(g_hWnd, nCmdShow);
+    UpdateWindow(g_hWnd);
+
+    // Message loop
+    MSG msg;
+    while (GetMessage(&msg, NULL, 0, 0))
+    {
+        TranslateMessage(&msg);
+        DispatchMessage(&msg);
+    }
+
+    CoUninitialize();
     return 0;
 }

@@ -5,6 +5,7 @@
             "label": "C/C++: cl.exe build active file",
             "command": "cl.exe",
             "args": [
+                "/std:c++17",
                 "/Zi", // Generate debugging information (.pdb files etc.)
                 "/EHsc", // Enable C++ exceptions
                 "/nologo", // Suppress startup banner
